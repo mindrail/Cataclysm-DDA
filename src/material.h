@@ -1,23 +1,24 @@
 #pragma once
-#ifndef MATERIAL_H
-#define MATERIAL_H
+#ifndef CATA_SRC_MATERIAL_H
+#define CATA_SRC_MATERIAL_H
 
+#include <algorithm>
 #include <cstddef>
 #include <map>
 #include <set>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "fire.h"
 #include "optional.h"
 #include "string_id.h"
+#include "translations.h"
 #include "type_id.h"
 
 class material_type;
 
-enum damage_type : int;
-using itype_id = std::string;
+enum class damage_type : int;
 class JsonObject;
 
 using mat_burn_products = std::vector<std::pair<itype_id, float>>;
@@ -32,7 +33,7 @@ class material_type
         bool was_loaded = false;
 
     private:
-        std::string _name;
+        translation _name;
         cata::optional<itype_id> _salvaged_into; // this material turns into this item when salvaged
         itype_id _repaired_with = itype_id( "null" ); // this material can be repaired with this item
         int _bash_resist = 0;                         // negative integers means susceptibility
@@ -40,20 +41,21 @@ class material_type
         int _acid_resist = 0;
         int _elec_resist = 0;
         int _fire_resist = 0;
+        int _bullet_resist = 0;
         int _chip_resist = 0;                         // Resistance to physical damage of the item itself
         int _density = 1;                             // relative to "powder", which is 1
-        float _specific_heat_liquid = 4.186;
-        float _specific_heat_solid = 2.108;
-        float _latent_heat = 334;
-        int _freeze_point = 32; // Farenheit
+        float _specific_heat_liquid = 4.186f;
+        float _specific_heat_solid = 2.108f;
+        float _latent_heat = 334.0f;
+        int _freeze_point = 32; // Fahrenheit
         bool _edible = false;
         bool _rotting = false;
         bool _soft = false;
         bool _reinforces = false;
 
-        std::string _bash_dmg_verb;
-        std::string _cut_dmg_verb;
-        std::vector<std::string> _dmg_adj;
+        translation _bash_dmg_verb;
+        translation _cut_dmg_verb;
+        std::vector<translation> _dmg_adj;
 
         std::map<vitamin_id, double> _vitamins;
 
@@ -68,10 +70,8 @@ class material_type
     public:
         material_type();
 
-        void load( JsonObject &jsobj, const std::string &src );
+        void load( const JsonObject &jsobj, const std::string &src );
         void check() const;
-
-        int dam_resist( damage_type damtype ) const;
 
         material_id ident() const;
         std::string name() const;
@@ -86,6 +86,7 @@ class material_type
         itype_id repaired_with() const;
         int bash_resist() const;
         int cut_resist() const;
+        int bullet_resist() const;
         std::string bash_dmg_verb() const;
         std::string cut_dmg_verb() const;
         std::string dmg_adj( int damage ) const;
@@ -117,7 +118,7 @@ class material_type
 namespace materials
 {
 
-void load( JsonObject &jo, const std::string &src );
+void load( const JsonObject &jo, const std::string &src );
 void check();
 void reset();
 
@@ -127,4 +128,4 @@ std::set<material_id> get_rotting();
 
 } // namespace materials
 
-#endif
+#endif // CATA_SRC_MATERIAL_H

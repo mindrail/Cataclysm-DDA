@@ -1,30 +1,45 @@
 #include "translations.h"
 
-#include <clocale>
 #include <array>
+#include <clocale>
+#include <cstdlib>
+#include <functional>
+#include <locale>
 
 #if defined(LOCALIZE) && defined(__STRICT_ANSI__)
 #undef __STRICT_ANSI__ // _putenv in minGW need that
-#include <cstdlib>
 
 #define __STRICT_ANSI__
 #endif
 
 #include <algorithm>
-#include <set>
-#include <string>
 #include <map>
 #include <memory>
 #include <ostream>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "cached_options.h"
+#include "cata_utility.h"
+#include "catacharset.h"
+#include "generic_factory.h"
 #include "json.h"
 #include "name.h"
 #include "output.h"
 #include "path_info.h"
-#include "cursesdef.h"
+#include "rng.h"
+#include "text_style_check.h"
+
+#if defined(MACOSX)
+#include <CoreFoundation/CFLocale.h>
+#include <CoreFoundation/CoreFoundation.h>
+
 #include "cata_utility.h"
+
+std::string getOSXSystemLang();
+#endif
 
 // Names depend on the language settings. They are loaded from different files
 // based on the currently used language. If that changes, we have to reload the
@@ -32,27 +47,20 @@
 static void reload_names()
 {
     Name::clear();
-    Name::load_from_file( PATH_INFO::find_translated_file( "namesdir", ".json", "names" ) );
+    Name::load_from_file( PATH_INFO::names() );
 }
 
 static bool sanity_checked_genders = false;
 
 #if defined(LOCALIZE)
-#include "options.h"
 #include "debug.h"
+#include "options.h"
 #include "ui.h"
 #if defined(_WIN32)
+#if 1 // Prevent IWYU reordering platform_win.h below mmsystem.h
 #   include "platform_win.h"
-#   include "mmsystem.h"
 #endif
-
-#if defined(MACOSX)
-#   include <CoreFoundation/CFLocale.h>
-#   include <CoreFoundation/CoreFoundation.h>
-
-#include "cata_utility.h"
-
-std::string getOSXSystemLang();
+#   include "mmsystem.h"
 #endif
 
 const char *pgettext( const char *context, const char *msgid )
@@ -144,8 +152,6 @@ void select_language()
         return lang.first.empty() || lang.second.empty();
     } ), languages.end() );
 
-    wrefresh( catacurses::stdscr );
-
     uilist sm;
     sm.allow_cancel = false;
     sm.text = _( "Select your language" );
@@ -170,7 +176,8 @@ void set_language()
     // Step 1. Setup locale settings.
     std::string lang_opt = get_option<std::string>( "USE_LANG" ).empty() ? win_or_mac_lang :
                            get_option<std::string>( "USE_LANG" );
-    if( !lang_opt.empty() ) { // Not 'System Language'
+    if( !lang_opt.empty() ) {
+        // Not 'System Language'
         // Overwrite all system locale settings. Use CDDA settings. User wants this.
 #if defined(_WIN32)
         std::string lang_env = "LANGUAGE=" + lang_opt;
@@ -183,7 +190,7 @@ void set_language()
         }
 #endif
         else {
-            const auto env = getenv( "LANGUAGE" );
+            const char *env = getenv( "LANGUAGE" );
             if( env != nullptr ) {
                 DebugLog( D_INFO, D_MAIN ) << "Language is set to: '" << env << '\'';
             } else {
@@ -197,19 +204,21 @@ void set_language()
     if( setlocale( LC_ALL, ".1252" ) == nullptr ) {
         DebugLog( D_WARNING, D_MAIN ) << "Error while setlocale(LC_ALL, '.1252').";
     }
+    DebugLog( D_INFO, DC_ALL ) << "[translations] C locale set to " << setlocale( LC_ALL, nullptr );
+    DebugLog( D_INFO, DC_ALL ) << "[translations] C++ locale set to " << std::locale().name();
 #endif
 
     // Step 2. Bind to gettext domain.
     std::string locale_dir;
 #if defined(__ANDROID__)
-    // Since we're using libintl-lite instead of libintl on Android, we hack the locale_dir to point directly to the .mo file.
+    // HACK: Since we're using libintl-lite instead of libintl on Android, we hack the locale_dir to point directly to the .mo file.
     // This is because of our hacky libintl-lite bindtextdomain() implementation.
     auto env = getenv( "LANGUAGE" );
-    locale_dir = std::string( FILENAMES["base_path"] + "lang/mo/" + ( env ? env : "none" ) +
+    locale_dir = std::string( PATH_INFO::base_path() + "lang/mo/" + ( env ? env : "none" ) +
                               "/LC_MESSAGES/cataclysm-dda.mo" );
 #elif (defined(__linux__) || (defined(MACOSX) && !defined(TILES)))
-    if( !FILENAMES["base_path"].empty() ) {
-        locale_dir = FILENAMES["base_path"] + "share/locale";
+    if( !PATH_INFO::base_path().empty() ) {
+        locale_dir = PATH_INFO::base_path() + "share/locale";
     } else {
         locale_dir = "lang/mo";
     }
@@ -236,15 +245,22 @@ std::string getOSXSystemLang()
         return "en_US";
     }
 
-    const char *lang_code_raw = CFStringGetCStringPtr(
-                                    reinterpret_cast<CFStringRef>( CFArrayGetValueAtIndex( langs, 0 ) ),
-                                    kCFStringEncodingUTF8 );
-    if( !lang_code_raw ) {
-        return "en_US";
+    CFStringRef lang = static_cast<CFStringRef>( CFArrayGetValueAtIndex( langs, 0 ) );
+    const char *lang_code_raw_fast = CFStringGetCStringPtr( lang, kCFStringEncodingUTF8 );
+    std::string lang_code;
+    if( lang_code_raw_fast ) { // fast way, probably it's never works
+        lang_code = lang_code_raw_fast;
+    } else { // fallback to slow way
+        CFIndex length = CFStringGetLength( lang ) + 1;
+        std::vector<char> lang_code_raw_slow( length, '\0' );
+        bool success = CFStringGetCString( lang, lang_code_raw_slow.data(), length, kCFStringEncodingUTF8 );
+        if( !success ) {
+            return "en_US";
+        }
+        lang_code = lang_code_raw_slow.data();
     }
 
     // Convert to the underscore format expected by gettext
-    std::string lang_code( lang_code_raw );
     std::replace( lang_code.begin(), lang_code.end(), '-', '_' );
 
     /**
@@ -332,7 +348,8 @@ std::string gettext_gendered( const GenderMap &genders, const std::string &msg )
 
     std::vector<std::string> chosen_genders;
     for( const auto &subject_genders : genders ) {
-        std::string chosen_gender = language_genders[0]; // default if no match
+        // default if no match
+        std::string chosen_gender = language_genders[0];
         for( const std::string &gender : subject_genders.second ) {
             if( std::find( language_genders.begin(), language_genders.end(), gender ) !=
                 language_genders.end() ) {
@@ -347,12 +364,12 @@ std::string gettext_gendered( const GenderMap &genders, const std::string &msg )
 }
 
 translation::translation()
-    : ctxt( cata::nullopt ), raw_pl( cata::nullopt ), needs_translation( false )
+    : ctxt( cata::nullopt ), raw_pl( cata::nullopt )
 {
 }
 
 translation::translation( const plural_tag )
-    : ctxt( cata::nullopt ), raw_pl( std::string() ), needs_translation( false )
+    : ctxt( cata::nullopt ), raw_pl( std::string() )
 {
 }
 
@@ -379,7 +396,7 @@ translation::translation( const std::string &ctxt, const std::string &raw,
 }
 
 translation::translation( const std::string &str, const no_translation_tag )
-    : ctxt( cata::nullopt ), raw( str ), raw_pl( cata::nullopt ), needs_translation( false )
+    : ctxt( cata::nullopt ), raw( str ), raw_pl( cata::nullopt )
 {
 }
 
@@ -427,29 +444,84 @@ void translation::deserialize( JsonIn &jsin )
 {
     if( jsin.test_string() ) {
         ctxt = cata::nullopt;
-        raw = jsin.get_string();
         // if plural form is enabled
         if( raw_pl ) {
+            // strings with plural forms are currently only simple names, and
+            // need no text style check.
+            raw = jsin.get_string();
             raw_pl = raw + "s";
+        } else {
+            raw = text_style_check_reader( text_style_check_reader::allow_object::no )
+                  .get_next( jsin );
         }
         needs_translation = true;
     } else {
         JsonObject jsobj = jsin.get_object();
-        if( jsobj.has_string( "ctxt" ) ) {
+        if( jsobj.has_member( "ctxt" ) ) {
             ctxt = jsobj.get_string( "ctxt" );
         } else {
             ctxt = cata::nullopt;
         }
-        raw = jsobj.get_string( "str" );
-        // if plural form is enabled
-        if( raw_pl ) {
-            if( jsobj.has_string( "str_pl" ) ) {
-                raw_pl = jsobj.get_string( "str_pl" );
+        if( jsobj.has_member( "str_sp" ) ) {
+            // same singular and plural forms
+            // strings with plural forms are currently only simple names, and
+            // need no text style check.
+            raw = jsobj.get_string( "str_sp" );
+            // if plural form is enabled
+            if( raw_pl ) {
+                raw_pl = raw;
             } else {
-                raw_pl = raw + "s";
+                try {
+                    jsobj.throw_error( "str_sp not supported here", "str_sp" );
+                } catch( const JsonError &e ) {
+                    debugmsg( "(json-error)\n%s", e.what() );
+                }
             }
-        } else if( jsobj.has_string( "str_pl" ) ) {
-            jsobj.throw_error( "str_pl not supported here", "str_pl" );
+        } else {
+#ifndef CATA_IN_TOOL
+            const bool check_style = test_mode && !jsobj.has_member( "//NOLINT(cata-text-style)" );
+#else
+            const bool check_style = false;
+#endif
+            if( raw_pl || !check_style ) {
+                // strings with plural forms are currently only simple names, and
+                // need no text style check.
+                raw = jsobj.get_string( "str" );
+            } else {
+                raw = text_style_check_reader( text_style_check_reader::allow_object::no )
+                      .get_next( *jsobj.get_raw( "str" ) );
+            }
+            // if plural form is enabled
+            if( raw_pl ) {
+                if( jsobj.has_member( "str_pl" ) ) {
+                    raw_pl = jsobj.get_string( "str_pl" );
+#ifndef CATA_IN_TOOL
+                    if( check_style ) {
+                        try {
+                            if( raw_pl.value() == raw + "s" ) {
+                                jsobj.throw_error( "\"str_pl\" is not necessary here since the "
+                                                   "plural form can be automatically generated.",
+                                                   "str_pl" );
+                            } else if( raw_pl.value() == raw ) {
+                                jsobj.throw_error( "Please use \"str_sp\" instead of \"str\" and \"str_pl\" "
+                                                   "for text with identical singular and plural forms",
+                                                   "str_pl" );
+                            }
+                        } catch( const JsonError &e ) {
+                            debugmsg( "(json-error)\n%s", e.what() );
+                        }
+                    }
+#endif
+                } else {
+                    raw_pl = raw + "s";
+                }
+            } else if( jsobj.has_member( "str_pl" ) ) {
+                try {
+                    jsobj.throw_error( "str_pl not supported here", "str_pl" );
+                } catch( const JsonError &e ) {
+                    debugmsg( "(json-error)\n%s", e.what() );
+                }
+            }
         }
         needs_translation = true;
     }
@@ -481,7 +553,7 @@ bool translation::empty() const
 
 bool translation::translated_lt( const translation &that ) const
 {
-    return translated() < that.translated();
+    return localized_compare( translated(), that.translated() );
 }
 
 bool translation::translated_eq( const translation &that ) const
@@ -503,6 +575,16 @@ bool translation::operator==( const translation &that ) const
 bool translation::operator!=( const translation &that ) const
 {
     return !operator==( that );
+}
+
+cata::optional<int> translation::legacy_hash() const
+{
+    if( needs_translation && !ctxt && !raw_pl ) {
+        return djb2_hash( reinterpret_cast<const unsigned char *>( raw.c_str() ) );
+    }
+    // Otherwise the translation must have been added after snippets were changed
+    // to use string ids only, so the translation doesn't have a legacy hash value.
+    return cata::nullopt;
 }
 
 translation to_translation( const std::string &raw )
@@ -550,3 +632,128 @@ std::string operator+( const translation &lhs, const translation &rhs )
 {
     return lhs.translated() + rhs.translated();
 }
+
+text_style_check_reader::text_style_check_reader( const allow_object object_allowed )
+    : object_allowed( object_allowed )
+{
+}
+
+std::string text_style_check_reader::get_next( JsonIn &jsin ) const
+{
+#ifndef CATA_IN_TOOL
+    int origin = 0;
+#endif
+    std::string raw;
+    bool check_style = true;
+    if( object_allowed == allow_object::yes && jsin.test_object() ) {
+        JsonObject jsobj = jsin.get_object();
+#ifndef CATA_IN_TOOL
+        if( test_mode ) {
+            origin = jsobj.get_raw( "str" )->tell();
+        }
+#endif
+        raw = jsobj.get_string( "str" );
+        if( jsobj.has_member( "//NOLINT(cata-text-style)" ) ) {
+            check_style = false;
+        }
+    } else {
+#ifndef CATA_IN_TOOL
+        if( test_mode ) {
+            origin = jsin.tell();
+        }
+#endif
+        raw = jsin.get_string();
+    }
+#ifndef CATA_IN_TOOL
+    if( test_mode && check_style ) {
+        const auto text_style_callback =
+            [&jsin, origin]
+            ( const text_style_fix type, const std::string & msg,
+              const std::u32string::const_iterator & beg, const std::u32string::const_iterator & /*end*/,
+              const std::u32string::const_iterator & /*at*/,
+              const std::u32string::const_iterator & from, const std::u32string::const_iterator & to,
+              const std::string & fix
+        ) {
+            std::string err;
+            switch( type ) {
+                case text_style_fix::removal:
+                    err = msg + "\n"
+                          + "    Suggested fix: remove \"" + utf32_to_utf8( std::u32string( from, to ) ) + "\"\n"
+                          + "    At the following position (marked with caret)";
+                    break;
+                case text_style_fix::insertion:
+                    err = msg + "\n"
+                          + "    Suggested fix: insert \"" + fix + "\"\n"
+                          + "    At the following position (marked with caret)";
+                    break;
+                case text_style_fix::replacement:
+                    err = msg + "\n"
+                          + "    Suggested fix: replace \"" + utf32_to_utf8( std::u32string( from, to ) )
+                          + "\" with \"" + fix + "\"\n"
+                          + "    At the following position (marked with caret)";
+                    break;
+            }
+            const int previous_pos = jsin.tell();
+            try {
+                jsin.seek( origin );
+                jsin.string_error( err, std::distance( beg, to ) );
+            } catch( const JsonError &e ) {
+                debugmsg( "(json-error)\n%s", e.what() );
+            }
+            // seek to previous pos (end of string) so subsequent json input
+            // can continue.
+            jsin.seek( previous_pos );
+        };
+
+        const std::u32string raw32 = utf8_to_utf32( raw );
+        text_style_check<std::u32string::const_iterator>( raw32.cbegin(), raw32.cend(),
+                fix_end_of_string_spaces::yes, escape_unicode::no, text_style_callback );
+    }
+#endif
+    return raw;
+}
+
+bool localized_comparator::operator()( const std::string &l, const std::string &r ) const
+{
+    // We need different implementations on each platform.  MacOS seems to not
+    // support localized comparison of strings via the standard library at all,
+    // so resort to MacOS-specific solution.  Windows cannot be expected to be
+    // using a UTF-8 locale (whereas our strings are always UTF-8) and so we
+    // must convert to wstring for comparison there.  Linux seems to work as
+    // expected on regular strings; no workarounds needed.
+    // See https://github.com/CleverRaven/Cataclysm-DDA/pull/40041 for further
+    // discussion.
+#if defined(MACOSX)
+    CFStringRef lr = CFStringCreateWithCStringNoCopy( kCFAllocatorDefault, l.c_str(),
+                     kCFStringEncodingUTF8, kCFAllocatorNull );
+    CFStringRef rr = CFStringCreateWithCStringNoCopy( kCFAllocatorDefault, r.c_str(),
+                     kCFStringEncodingUTF8, kCFAllocatorNull );
+    bool result = CFStringCompare( lr, rr, kCFCompareLocalized ) < 0;
+    CFRelease( lr );
+    CFRelease( rr );
+    return result;
+#elif defined(_WIN32)
+    return ( *this )( utf8_to_wstr( l ), utf8_to_wstr( r ) );
+#else
+    return std::locale()( l, r );
+#endif
+}
+
+bool localized_comparator::operator()( const std::wstring &l, const std::wstring &r ) const
+{
+#if defined(MACOSX)
+    return ( *this )( wstr_to_utf8( l ), wstr_to_utf8( r ) );
+#else
+    return std::locale()( l, r );
+#endif
+}
+
+bool localized_comparator::operator()( const translation &l, const translation &r ) const
+{
+    return l.translated_lt( r );
+}
+
+// silence -Wunused-macro
+#ifdef __STRICT_ANSI__
+#undef __STRICT_ANSI__
+#endif

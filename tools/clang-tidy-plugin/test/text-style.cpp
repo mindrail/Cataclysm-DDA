@@ -58,11 +58,9 @@ static void bar()
     str += "foo, ";
     str += "bar.";
     some_stream() << "foo, " << "bar.";
+    foo( "A .308 rifle" );
+    foo( "foo != bar" );
 
-    // macro expansion
-    foo( passthrough( "foo" ) ",  bar." );
-    // CHECK-MESSAGES: [[@LINE-1]]:33: warning: excessive spaces at this location.  1 required, but 2 found.
-    // CHECK-FIXES: foo( passthrough( "foo" ) ", bar." );
     // do not fix to avoid removing the prefix
     foo( "Foobar. " u8" \nBaz." );
     // CHECK-MESSAGES: [[@LINE-1]]:18: warning: unnecessary spaces at end of line.
@@ -72,6 +70,10 @@ static void bar()
     // CHECK-MESSAGES: [[@LINE-1]]:18: warning: unnecessary spaces at end of line.
     // CHECK-FIXES: foo( "Foobar. " R"( )" "\n" );
 
+    // macro expansion
+    foo( passthrough( "foo" ) ",  bar." );
+    // CHECK-MESSAGES: [[@LINE-1]]:33: warning: excessive spaces at this location.  1 required, but 2 found.
+    // CHECK-FIXES: foo( passthrough( "foo" ) ", bar." );
     foo( "\t" );
     // CHECK-MESSAGES: [[@LINE-1]]:11: warning: spaces preferred over tab.
     // CHECK-FIXES: foo( "    " );
@@ -84,6 +86,9 @@ static void bar()
     foo( "..." );
     // CHECK-MESSAGES: [[@LINE-1]]:11: warning: ellipsis preferred over three dots.
     // CHECK-FIXES: foo( "\u2026" );
+    foo( "foo..." );
+    // CHECK-MESSAGES: [[@LINE-1]]:14: warning: ellipsis preferred over three dots.
+    // CHECK-FIXES: foo( "foo\u2026" );
     foo( "Three.  \nTwo.  One." );
     // CHECK-MESSAGES: [[@LINE-1]]:17: warning: unnecessary spaces at end of line.
     // CHECK-FIXES: foo( "Three.\nTwo.  One." );

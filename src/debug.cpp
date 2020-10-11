@@ -1,46 +1,52 @@
 #include "debug.h"
 
-#include <sys/stat.h>
-#include <cctype>
-#include <cstdio>
 #include <algorithm>
-#include <cassert>
+#include <cctype>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
-#include <cstdint>
 #include <iterator>
 #include <locale>
 #include <map>
 #include <memory>
 #include <set>
 #include <sstream>
+#include <sys/stat.h> // IWYU pragma
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "cached_options.h"
+#include "cata_assert.h"
+#include "cata_utility.h"
+#include "color.h"
 #include "cursesdef.h"
 #include "filesystem.h"
 #include "get_version.h"
 #include "input.h"
+#include "mod_manager.h"
+#include "optional.h"
+#include "options.h"
 #include "output.h"
 #include "path_info.h"
-#include "cata_utility.h"
-#include "color.h"
-#include "optional.h"
+#include "point.h"
 #include "translations.h"
-#include "worldfactory.h"
-#include "mod_manager.h"
 #include "type_id.h"
+#include "ui_manager.h"
+#include "worldfactory.h"
 
 #if !defined(_MSC_VER)
 #include <sys/time.h>
 #endif
 
 #if defined(_WIN32)
-#   if 1 // Hack to prevent reordering of #include "platform_win.h" by IWYU
+#   if 1 // HACK: Hack to prevent reordering of #include "platform_win.h" by IWYU
 #       include "platform_win.h"
 #   endif
 #endif
@@ -48,6 +54,9 @@
 #if defined(BACKTRACE)
 #   if defined(_WIN32)
 #       include <dbghelp.h>
+#       if defined(LIBBACKTRACE)
+#           include <backtrace.h>
+#       endif
 #   else
 #       include <execinfo.h>
 #       include <unistd.h>
@@ -78,10 +87,51 @@ static int debugLevel = D_ERROR;
 static int debugClass = D_MAIN;
 #endif
 
-extern bool test_mode;
-
 /** Set to true when any error is logged. */
 static bool error_observed = false;
+
+/** If true, debug messages will be captured,
+ * used to test debugmsg calls in the unit tests
+ */
+static bool capturing = false;
+/** сaptured debug messages */
+static std::string captured;
+
+/**
+ * Class for capturing debugmsg,
+ * used by capture_debugmsg_during.
+ */
+class capture_debugmsg
+{
+    public:
+        capture_debugmsg();
+        std::string dmsg();
+        ~capture_debugmsg();
+};
+
+std::string capture_debugmsg_during( const std::function<void()> &func )
+{
+    capture_debugmsg capture;
+    func();
+    return capture.dmsg();
+}
+
+capture_debugmsg::capture_debugmsg()
+{
+    capturing = true;
+    captured.clear();
+}
+
+std::string capture_debugmsg::dmsg()
+{
+    capturing = false;
+    return captured;
+}
+
+capture_debugmsg::~capture_debugmsg()
+{
+    capturing = false;
+}
 
 bool debug_has_error_been_observed()
 {
@@ -90,6 +140,13 @@ bool debug_has_error_been_observed()
 
 bool debug_mode = false;
 
+struct buffered_prompt_info {
+    std::string filename;
+    std::string line;
+    std::string funcname;
+    std::string text;
+};
+
 namespace
 {
 
@@ -97,30 +154,31 @@ std::set<std::string> ignored_messages;
 
 } // namespace
 
-void realDebugmsg( const char *filename, const char *line, const char *funcname,
-                   const std::string &text )
+// debugmsg prompts that could not be shown immediately are buffered and replayed when catacurses::stdscr is available
+// need to use method here to ensure `buffered_prompts` vector is initialized single time
+static std::vector<buffered_prompt_info> &buffered_prompts()
 {
-    assert( filename != nullptr );
-    assert( line != nullptr );
-    assert( funcname != nullptr );
+    static std::vector<buffered_prompt_info> buffered_prompts;
+    return buffered_prompts;
+}
 
-    DebugLog( D_ERROR, D_MAIN ) << filename << ":" << line << " [" << funcname << "] "
-                                << text << std::flush;
-
-    if( test_mode ) {
-        return;
-    }
+static void debug_error_prompt(
+    const char *filename,
+    const char *line,
+    const char *funcname,
+    const char *text )
+{
+    cata_assert( catacurses::stdscr );
+    cata_assert( filename != nullptr );
+    cata_assert( line != nullptr );
+    cata_assert( funcname != nullptr );
+    cata_assert( text != nullptr );
 
     std::string msg_key( filename );
     msg_key += line;
 
     if( ignored_messages.count( msg_key ) > 0 ) {
         return;
-    }
-
-    if( !catacurses::stdscr ) {
-        std::cerr << text << std::endl;
-        abort();
     }
 
     std::string formatted_report =
@@ -136,43 +194,58 @@ void realDebugmsg( const char *filename, const char *line, const char *funcname,
     std::string backtrace_instructions =
         string_format(
             _( "See %s for a full stack backtrace" ),
-            FILENAMES["debug"]
+            PATH_INFO::debug()
         );
 #endif
 
-    fold_and_print( catacurses::stdscr, point_zero, getmaxx( catacurses::stdscr ), c_light_red,
-                    "\n\n" // Looks nicer with some space
-                    " %s\n" // translated user string: error notification
-                    " -----------------------------------------------------------\n"
-                    "%s"
-                    " -----------------------------------------------------------\n"
+    // temporarily disable redrawing and resizing of previous uis since they
+    // could be in an unknown state.
+    ui_adaptor ui( ui_adaptor::disable_uis_below {} );
+    const auto init_window = []( ui_adaptor & ui ) {
+        ui.position_from_window( catacurses::stdscr );
+    };
+    init_window( ui );
+    ui.on_screen_resize( init_window );
+    const std::string message = string_format(
+                                    "\n\n" // Looks nicer with some space
+                                    " %s\n" // translated user string: error notification
+                                    " -----------------------------------------------------------\n"
+                                    "%s"
+                                    " -----------------------------------------------------------\n"
 #if defined(BACKTRACE)
-                    " %s\n" // translated user string: where to find backtrace
+                                    " %s\n" // translated user string: where to find backtrace
 #endif
-                    " %s\n" // translated user string: space to continue
-                    " %s\n" // translated user string: ignore key
+                                    " %s\n" // translated user string: space to continue
+                                    " %s\n" // translated user string: ignore key
 #if defined(TILES)
-                    " %s\n" // translated user string: copy
+                                    " %s\n" // translated user string: copy
 #endif // TILES
-                    , _( "An error has occurred!  Written below is the error report:" ),
-                    formatted_report,
+                                    , _( "An error has occurred!  Written below is the error report:" ),
+                                    formatted_report,
 #if defined(BACKTRACE)
-                    backtrace_instructions,
+                                    backtrace_instructions,
 #endif
-                    _( "Press <color_white>space bar</color> to continue the game." ),
-                    _( "Press <color_white>I</color> (or <color_white>i</color>) to also ignore this particular message in the future." )
+                                    _( "Press <color_white>space bar</color> to continue the game." ),
+                                    _( "Press <color_white>I</color> (or <color_white>i</color>) to also ignore this particular message in the future." )
 #if defined(TILES)
-                    , _( "Press <color_white>C</color> (or <color_white>c</color>) to copy this message to the clipboard." )
+                                    , _( "Press <color_white>C</color> (or <color_white>c</color>) to copy this message to the clipboard." )
 #endif // TILES
-                  );
+                                );
+    ui.on_redraw( [&]( const ui_adaptor & ) {
+        catacurses::erase();
+        fold_and_print( catacurses::stdscr, point_zero, getmaxx( catacurses::stdscr ), c_light_red,
+                        "%s", message );
+        catacurses::refresh();
+    } );
 
 #if defined(__ANDROID__)
-    input_context ctxt( "DEBUG_MSG" );
+    input_context ctxt( "DEBUG_MSG", keyboard_mode::keycode );
     ctxt.register_manual_key( 'C' );
     ctxt.register_manual_key( 'I' );
     ctxt.register_manual_key( ' ' );
 #endif
     for( bool stop = false; !stop; ) {
+        ui_manager::redraw();
         switch( inp_mngr.get_input_event().get_first_input() ) {
 #if defined(TILES)
             case 'c':
@@ -189,9 +262,48 @@ void realDebugmsg( const char *filename, const char *line, const char *funcname,
                 break;
         }
     }
+}
 
-    werase( catacurses::stdscr );
-    catacurses::refresh();
+void replay_buffered_debugmsg_prompts()
+{
+    if( buffered_prompts().empty() || !catacurses::stdscr ) {
+        return;
+    }
+    for( const auto &prompt : buffered_prompts() ) {
+        debug_error_prompt(
+            prompt.filename.c_str(),
+            prompt.line.c_str(),
+            prompt.funcname.c_str(),
+            prompt.text.c_str()
+        );
+    }
+    buffered_prompts().clear();
+}
+
+void realDebugmsg( const char *filename, const char *line, const char *funcname,
+                   const std::string &text )
+{
+    cata_assert( filename != nullptr );
+    cata_assert( line != nullptr );
+    cata_assert( funcname != nullptr );
+
+    if( capturing ) {
+        captured += text;
+    } else {
+        DebugLog( D_ERROR, D_MAIN ) << filename << ":" << line << " [" << funcname << "] " << text <<
+                                    std::flush;
+    }
+
+    if( test_mode ) {
+        return;
+    }
+
+    if( !catacurses::stdscr ) {
+        buffered_prompts().push_back( {filename, line, funcname, text } );
+        return;
+    }
+
+    debug_error_prompt( filename, line, funcname, text.c_str() );
 }
 
 // Normal functions                                                 {{{1
@@ -211,27 +323,6 @@ void limitDebugClass( int class_bitmask )
 
 // Debug only                                                       {{{1
 // ---------------------------------------------------------------------
-
-#if defined(BACKTRACE)
-#if defined(_WIN32)
-constexpr int module_path_len = 512;
-// on some systems the number of frames to capture have to be less than 63 according to the documentation
-constexpr int bt_cnt = 62;
-constexpr int max_name_len = 512;
-// ( max_name_len - 1 ) because SYMBOL_INFO already contains a TCHAR
-constexpr int sym_size = sizeof( SYMBOL_INFO ) + ( max_name_len - 1 ) * sizeof( TCHAR );
-static char mod_path[module_path_len];
-static PVOID bt[bt_cnt];
-static struct {
-    alignas( SYMBOL_INFO ) char storage[sym_size];
-} sym_storage;
-static SYMBOL_INFO &sym = reinterpret_cast<SYMBOL_INFO &>( sym_storage );
-#else
-#define TRACE_SIZE 20
-
-void *tracePtrs[TRACE_SIZE];
-#endif
-#endif
 
 // Debug Includes                                                   {{{2
 // ---------------------------------------------------------------------
@@ -287,11 +378,11 @@ static time_info get_time() noexcept
     timeval tv;
     gettimeofday( &tv, nullptr );
 
-    const auto tt      = time_t {tv.tv_sec};
-    const auto current = localtime( &tt );
+    const time_t tt      = time_t {tv.tv_sec};
+    struct tm *const current = localtime( &tt );
 
     return time_info { current->tm_hour, current->tm_min, current->tm_sec,
-                       static_cast<int>( lround( tv.tv_usec / 1000.0 ) )
+                       static_cast<int>( std::lround( tv.tv_usec / 1000.0 ) )
                      };
 }
 #endif
@@ -301,6 +392,7 @@ struct DebugFile {
     ~DebugFile();
     void init( DebugOutput, const std::string &filename );
     void deinit();
+    std::ostream &get_file();
 
     // Using shared_ptr for the type-erased deleter support, not because
     // it needs to be shared.
@@ -308,13 +400,19 @@ struct DebugFile {
     std::string filename;
 };
 
-static NullBuf nullBuf;
-static std::ostream nullStream( &nullBuf );
-
 // DebugFile OStream Wrapper                                        {{{2
 // ---------------------------------------------------------------------
 
-static DebugFile debugFile;
+// needs to be inside the method to ensure it's initialized (and only once)
+// NOTE: using non-local static variables (defined at top level in cpp file) here is wrong,
+// because DebugLog (that uses them) might be called from the constructor of some non-local static entity
+// during dynamic initialization phase, when non-local static variables here are
+// only zero-initialized
+static DebugFile &debugFile()
+{
+    static DebugFile debugFile;
+    return debugFile;
+}
 
 DebugFile::DebugFile() = default;
 
@@ -333,12 +431,23 @@ void DebugFile::deinit()
     file.reset();
 }
 
+std::ostream &DebugFile::get_file()
+{
+    if( !file ) {
+        file = std::make_shared<std::ostringstream>();
+    }
+    return *file;
+}
+
 void DebugFile::init( DebugOutput output_mode, const std::string &filename )
 {
+    std::shared_ptr<std::ostringstream> str_buffer = std::dynamic_pointer_cast<std::ostringstream>
+            ( file );
+
     switch( output_mode ) {
         case DebugOutput::std_err:
             file = std::shared_ptr<std::ostream>( &std::cerr, null_deleter() );
-            return;
+            break;
         case DebugOutput::file: {
             this->filename = filename;
             const std::string oldfile = filename + ".prev";
@@ -363,10 +472,15 @@ void DebugFile::init( DebugOutput output_mode, const std::string &filename )
                                             "previous log file.";
             }
         }
-        return;
+        break;
         default:
             std::cerr << "Unexpected debug output mode " << static_cast<int>( output_mode )
                       << std::endl;
+            return;
+    }
+
+    if( str_buffer && file ) {
+        *file << str_buffer->str();
     }
 }
 
@@ -416,12 +530,12 @@ void setupDebug( DebugOutput output_mode )
         limitDebugClass( cl );
     }
 
-    debugFile.init( output_mode, FILENAMES["debug"] );
+    debugFile().init( output_mode, PATH_INFO::debug() );
 }
 
 void deinitDebug()
 {
-    debugFile.deinit();
+    debugFile().deinit();
 }
 
 // OStream Operators                                                {{{2
@@ -484,7 +598,7 @@ static bool debug_is_safe_string( const char *start, const char *finish )
     using std::end;
     const auto is_safe_char =
     [&]( char c ) {
-        auto in_safe = std::find( begin( safe_chars ), end( safe_chars ), c );
+        const char *in_safe = std::find( begin( safe_chars ), end( safe_chars ), c );
         return c && in_safe != end( safe_chars );
     };
     return std::all_of( start, finish, is_safe_char );
@@ -578,25 +692,122 @@ static cata::optional<uintptr_t> debug_compute_load_offset(
 }
 #endif
 
+#if defined(_WIN32) && defined(LIBBACKTRACE)
+// wrap libbacktrace to use std::function instead of function pointers
+using bt_error_callback = std::function<void( const char *, int )>;
+using bt_full_callback = std::function<int( uintptr_t, const char *, int, const char * )>;
+using bt_syminfo_callback = std::function<void( uintptr_t, const char *, uintptr_t, uintptr_t )>;
+
+static backtrace_state *bt_create_state( const char *const filename, const int threaded,
+        const bt_error_callback &cb )
+{
+    return backtrace_create_state( filename, threaded,
+    []( void *const data, const char *const msg, const int errnum ) {
+        const bt_error_callback &cb = *reinterpret_cast<const bt_error_callback *>( data );
+        cb( msg, errnum );
+    },
+    const_cast<bt_error_callback *>( &cb ) );
+}
+
+static int bt_pcinfo( backtrace_state *const state, const uintptr_t pc,
+                      const bt_full_callback &cb_full, const bt_error_callback &cb_error )
+{
+    using cb_pair = std::pair<const bt_full_callback &, const bt_error_callback &>;
+    cb_pair cb { cb_full, cb_error };
+    return backtrace_pcinfo( state, pc,
+                             // backtrace callback
+                             []( void *const data, const uintptr_t pc, const char *const filename,
+    const int lineno, const char *const function ) -> int {
+        cb_pair &cb = *reinterpret_cast<cb_pair *>( data );
+        return cb.first( pc, filename, lineno, function );
+    },
+    // error callback
+    []( void *const data, const char *const msg, const int errnum ) {
+        cb_pair &cb = *reinterpret_cast<cb_pair *>( data );
+        cb.second( msg, errnum );
+    },
+    &cb );
+}
+
+static int bt_syminfo( backtrace_state *const state, const uintptr_t addr,
+                       const bt_syminfo_callback &cb_syminfo, const bt_error_callback cb_error )
+{
+    using cb_pair = std::pair<const bt_syminfo_callback &, const bt_error_callback &>;
+    cb_pair cb { cb_syminfo, cb_error };
+    return backtrace_syminfo( state, addr,
+                              // syminfo callback
+                              []( void *const data, const uintptr_t pc, const char *const symname,
+    const uintptr_t symval, const uintptr_t symsize ) {
+        cb_pair &cb = *reinterpret_cast<cb_pair *>( data );
+        cb.first( pc, symname, symval, symsize );
+    },
+    // error callback
+    []( void *const data, const char *const msg, const int errnum ) {
+        cb_pair &cb = *reinterpret_cast<cb_pair *>( data );
+        cb.second( msg, errnum );
+    },
+    &cb );
+}
+#endif
+
+#if defined(_WIN32)
+class sym_init
+{
+    public:
+        sym_init() {
+            SymInitialize( GetCurrentProcess(), nullptr, TRUE );
+        }
+
+        ~sym_init() {
+            SymCleanup( GetCurrentProcess() );
+        }
+};
+static std::unique_ptr<sym_init> sym_init_;
+
+constexpr int module_path_len = 512;
+// on some systems the number of frames to capture have to be less than 63 according to the documentation
+constexpr int bt_cnt = 62;
+constexpr int max_name_len = 512;
+// ( max_name_len - 1 ) because SYMBOL_INFO already contains a TCHAR
+constexpr int sym_size = sizeof( SYMBOL_INFO ) + ( max_name_len - 1 ) * sizeof( TCHAR );
+static char mod_path[module_path_len];
+static PVOID bt[bt_cnt];
+static struct {
+    alignas( SYMBOL_INFO ) char storage[sym_size];
+} sym_storage;
+static SYMBOL_INFO &sym = reinterpret_cast<SYMBOL_INFO &>( sym_storage );
+#if defined(LIBBACKTRACE)
+static std::map<DWORD64, backtrace_state *> bt_states;
+#endif
+#else
+static constexpr int bt_cnt = 20;
+static void *bt[bt_cnt];
+#endif
+
 void debug_write_backtrace( std::ostream &out )
 {
 #if defined(_WIN32)
+    if( !sym_init_ ) {
+        sym_init_ = std::make_unique<sym_init>();
+    }
     sym.SizeOfStruct = sizeof( SYMBOL_INFO );
     sym.MaxNameLen = max_name_len;
-    USHORT num_bt = CaptureStackBackTrace( 0, bt_cnt, bt, NULL );
-    HANDLE proc = GetCurrentProcess();
+    // libbacktrace's own backtrace capturing doesn't seem to work on Windows
+    const USHORT num_bt = CaptureStackBackTrace( 0, bt_cnt, bt, nullptr );
+    const HANDLE proc = GetCurrentProcess();
     for( USHORT i = 0; i < num_bt; ++i ) {
         DWORD64 off;
-        out << "\n    (";
+        out << "\n  #" << i;
+        out << "\n    (dbghelp: ";
         if( SymFromAddr( proc, reinterpret_cast<DWORD64>( bt[i] ), &off, &sym ) ) {
             out << sym.Name << "+0x" << std::hex << off << std::dec;
         }
         out << "@" << bt[i];
-        DWORD64 mod_base = SymGetModuleBase64( proc, reinterpret_cast<DWORD64>( bt[i] ) );
+        const DWORD64 mod_base = SymGetModuleBase64( proc, reinterpret_cast<DWORD64>( bt[i] ) );
         if( mod_base ) {
             out << "[";
-            DWORD mod_len = GetModuleFileName( reinterpret_cast<HMODULE>( mod_base ), mod_path,
-                                               module_path_len );
+            const DWORD mod_len = GetModuleFileName( reinterpret_cast<HMODULE>( mod_base ), mod_path,
+                                  module_path_len );
             // mod_len == module_path_len means insufficient buffer
             if( mod_len > 0 && mod_len < module_path_len ) {
                 const char *mod_name = mod_path + mod_len;
@@ -610,6 +821,67 @@ void debug_write_backtrace( std::ostream &out )
                 std::dec << "]";
         }
         out << "), ";
+#if defined(LIBBACKTRACE)
+        backtrace_state *bt_state = nullptr;
+        if( mod_base ) {
+            const auto it = bt_states.find( mod_base );
+            if( it != bt_states.end() ) {
+                bt_state = it->second;
+            } else {
+                const DWORD mod_len = GetModuleFileName( reinterpret_cast<HMODULE>( mod_base ), mod_path,
+                                      module_path_len );
+                if( mod_len > 0 && mod_len < module_path_len ) {
+                    bt_state = bt_create_state( mod_path, 0,
+                                                // error callback
+                    [&out]( const char *const msg, const int errnum ) {
+                        out << "\n    (backtrace_create_state failed: errno = " << errnum
+                            << ", msg = " << ( msg ? msg : "[no msg]" ) << "),";
+                    } );
+                } else {
+                    out << "\n    (executable path exceeds " << module_path_len << " chars),";
+                }
+                if( bt_state ) {
+                    bt_states.emplace( mod_base, bt_state );
+                }
+            }
+        } else {
+            out << "\n    (unable to get module base address),";
+        }
+        if( bt_state ) {
+            bt_syminfo( bt_state, reinterpret_cast<uintptr_t>( bt[i] ),
+                        // syminfo callback
+                        [&out]( const uintptr_t pc, const char *const symname,
+            const uintptr_t symval, const uintptr_t ) {
+                out << "\n    (libbacktrace: " << ( symname ? symname : "[unknown symbol]" )
+                    << "+0x" << std::hex << pc - symval << std::dec
+                    << "@0x" << std::hex << pc << std::dec
+                    << "),";
+            },
+            // error callback
+            [&out]( const char *const msg, const int errnum ) {
+                out << "\n    (backtrace_syminfo failed: errno = " << errnum
+                    << ", msg = " << ( msg ? msg : "[no msg]" )
+                    << "),";
+            } );
+            bt_pcinfo( bt_state, reinterpret_cast<uintptr_t>( bt[i] ),
+                       // backtrace callback
+                       [&out]( const uintptr_t pc, const char *const filename,
+            const int lineno, const char *const function ) -> int {
+                out << "\n    (libbacktrace: 0x" << std::hex << pc << std::dec
+                    << "    " << ( filename ? filename : "[unknown src]" )
+                    << ":" << lineno
+                    << "    " << ( function ? function : "[unknown func]" )
+                    << "),";
+                return 0;
+            },
+            // error callback
+            [&out]( const char *const msg, const int errnum ) {
+                out << "\n    (backtrace_pcinfo failed: errno = " << errnum
+                    << ", msg = " << ( msg ? msg : "[no msg]" )
+                    << "),";
+            } );
+        }
+#endif
     }
     out << "\n";
 #else
@@ -617,12 +889,12 @@ void debug_write_backtrace( std::ostream &out )
     // BACKTRACE is not supported under CYGWIN!
     ( void ) out;
 #   else
-    int count = backtrace( tracePtrs, TRACE_SIZE );
-    char **funcNames = backtrace_symbols( tracePtrs, count );
+    int count = backtrace( bt, bt_cnt );
+    char **funcNames = backtrace_symbols( bt, count );
     for( int i = 0; i < count; ++i ) {
         out << "\n    " << funcNames[i];
     }
-    out << "\n\n    Attempting to repeat stack trace using debug symbols...\n";
+    out << "\n\n    Attempting to repeat stack trace using debug symbols…\n";
     // Try to print the backtrace again, but this time using addr2line
     // to extract debug info and thus get a more detailed / useful
     // version.  If addr2line is not available this will just fail,
@@ -659,13 +931,13 @@ void debug_write_backtrace( std::ostream &out )
             out.write( "    ", 4 );
             // Strip leading directories for source file path
             char search_for[] = "/src/";
-            auto buf_end = buf + strlen( buf );
-            auto src = std::find_end( buf, buf_end,
-                                      search_for, search_for + strlen( search_for ) );
+            char *buf_end = buf + strlen( buf );
+            char *src = std::find_end( buf, buf_end,
+                                       search_for, search_for + strlen( search_for ) );
             if( src == buf_end ) {
                 src = buf;
             } else {
-                out.write( "...", 3 );
+                out << "…";
             }
             out.write( src, strlen( src ) );
         }
@@ -684,12 +956,12 @@ void debug_write_backtrace( std::ostream &out )
         // From that we need to extract the binary name, the symbol
         // name, and the offset within the symbol.  We don't need to
         // extract the address (the last thing) because that's already
-        // available in tracePtrs.
+        // available in bt.
 
-        auto funcName = funcNames[i];
-        assert( funcName ); // To appease static analysis
-        const auto funcNameEnd = funcName + std::strlen( funcName );
-        const auto binaryEnd = std::find( funcName, funcNameEnd, '(' );
+        char *funcName = funcNames[i];
+        cata_assert( funcName ); // To appease static analysis
+        char *const funcNameEnd = funcName + std::strlen( funcName );
+        char *const binaryEnd = std::find( funcName, funcNameEnd, '(' );
         if( binaryEnd == funcNameEnd ) {
             out << "    backtrace: Could not extract binary name from line\n";
             continue;
@@ -708,18 +980,18 @@ void debug_write_backtrace( std::ostream &out )
         // correct addresses to addr2line
         auto load_offset = load_offsets.find( binary_name );
         if( load_offset == load_offsets.end() ) {
-            const auto symbolNameStart = binaryEnd + 1;
-            const auto symbolNameEnd = std::find( symbolNameStart, funcNameEnd, '+' );
-            const auto offsetEnd = std::find( symbolNameStart, funcNameEnd, ')' );
+            char *const symbolNameStart = binaryEnd + 1;
+            char *const symbolNameEnd = std::find( symbolNameStart, funcNameEnd, '+' );
+            char *const offsetEnd = std::find( symbolNameStart, funcNameEnd, ')' );
 
             if( symbolNameEnd < offsetEnd && offsetEnd < funcNameEnd ) {
-                const auto offsetStart = symbolNameEnd + 1;
+                char *const offsetStart = symbolNameEnd + 1;
                 std::string symbol_name( symbolNameStart, symbolNameEnd );
                 std::string offset_within_symbol( offsetStart, offsetEnd );
 
                 cata::optional<uintptr_t> offset =
                     debug_compute_load_offset( binary_name, symbol_name, offset_within_symbol,
-                                               tracePtrs[i], out );
+                                               bt[i], out );
                 if( offset ) {
                     load_offsets.emplace( binary_name, *offset );
                 }
@@ -739,7 +1011,7 @@ void debug_write_backtrace( std::ostream &out )
         }
 
         last_binary_name = binary_name;
-        addresses.push_back( reinterpret_cast<uintptr_t>( tracePtrs[i] ) );
+        addresses.push_back( reinterpret_cast<uintptr_t>( bt[i] ) );
     }
 
     if( !addresses.empty() ) {
@@ -757,16 +1029,10 @@ std::ostream &DebugLog( DebugLevel lev, DebugClass cl )
         error_observed = true;
     }
 
-    // If debugging has not been initialized then stop
-    // (we could instead use std::cerr in this case?)
-    if( !debugFile.file ) {
-        return nullStream;
-    }
-
     // Error are always logged, they are important,
     // Messages from D_MAIN come from debugmsg and are equally important.
     if( ( lev & debugLevel && cl & debugClass ) || lev & D_ERROR || cl & D_MAIN ) {
-        std::ostream &out = *debugFile.file;
+        std::ostream &out = debugFile().get_file();
         out << std::endl;
         out << get_time() << " ";
         out << lev;
@@ -787,11 +1053,15 @@ std::ostream &DebugLog( DebugLevel lev, DebugClass cl )
             // Cool down for 60s between backtrace emissions.
             next_backtrace = after + 60;
             out << "Backtrace emission took " << after - now << " seconds." << std::endl;
+            out << "(continued from above) " << lev << ": ";
         }
 #endif
 
         return out;
     }
+
+    static NullBuf nullBuf;
+    static std::ostream nullStream( &nullBuf );
     return nullStream;
 }
 
@@ -829,7 +1099,7 @@ std::string game_info::operating_system()
 #endif
 }
 
-#if !defined(__CYGWIN__) && ( defined (__linux__) || defined(unix) || defined(__unix__) || defined(__unix) || ( defined(__APPLE__) && defined(__MACH__) ) || defined(BSD) ) // linux; unix; MacOs; BSD
+#if !defined(__CYGWIN__) && !defined (__ANDROID__) && ( defined (__linux__) || defined(unix) || defined(__unix__) || defined(__unix) || ( defined(__APPLE__) && defined(__MACH__) ) || defined(BSD) ) // linux; unix; MacOs; BSD
 /** Execute a command with the shell by using `popen()`.
  * @param command The full command to execute.
  * @note The output buffer is limited to 512 characters.
@@ -925,7 +1195,7 @@ static std::string linux_version()
         // replace '\n' and '\t' in output.
         static const std::vector<std::pair<std::string, std::string>> to_replace = {
             {"\n", "; "},
-            {"\t", " "},
+            {"\t", " "}, // NOLINT(cata-text-style)
         };
         for( const auto &e : to_replace ) {
             std::string::size_type pos;
@@ -1104,7 +1374,7 @@ std::string game_info::mods_loaded()
     std::vector<std::string> mod_names;
     mod_names.reserve( mod_ids.size() );
     std::transform( mod_ids.begin(), mod_ids.end(),
-    std::back_inserter( mod_names ), []( const mod_id mod ) -> std::string {
+    std::back_inserter( mod_names ), []( const mod_id & mod ) -> std::string {
         // e.g. "Dark Days Ahead [dda]".
         return string_format( "%s [%s]", mod->name(), mod->ident.str() );
     } );
@@ -1119,11 +1389,22 @@ std::string game_info::game_report()
         os_version = "<unknown>";
     }
     std::stringstream report;
+
+    std::string lang = get_option<std::string>( "USE_LANG" );
+    std::string lang_translated;
+    for( const options_manager::id_and_option &vItem : options_manager::get_lang_options() ) {
+        if( vItem.first == lang ) {
+            lang_translated = vItem.second.translated();
+            break;
+        }
+    }
+
     report <<
            "- OS: " << operating_system() << "\n" <<
            "    - OS Version: " << os_version << "\n" <<
            "- Game Version: " << game_version() << " [" << bitness() << "]\n" <<
            "- Graphics Version: " << graphics_version() << "\n" <<
+           "- Game Language: " << lang_translated << " [" << lang << "]\n" <<
            "- Mods loaded: [\n    " << mods_loaded() << "\n]\n";
 
     return report.str();

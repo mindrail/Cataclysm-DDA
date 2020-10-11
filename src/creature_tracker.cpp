@@ -5,6 +5,7 @@
 #include <string>
 #include <utility>
 
+#include "cata_assert.h"
 #include "debug.h"
 #include "mongroup.h"
 #include "monster.h"
@@ -18,11 +19,11 @@ Creature_tracker::Creature_tracker() = default;
 
 Creature_tracker::~Creature_tracker() = default;
 
-std::shared_ptr<monster> Creature_tracker::find( const tripoint &pos ) const
+shared_ptr_fast<monster> Creature_tracker::find( const tripoint &pos ) const
 {
     const auto iter = monsters_by_location.find( pos );
     if( iter != monsters_by_location.end() ) {
-        const std::shared_ptr<monster> &mon_ptr = iter->second;
+        const shared_ptr_fast<monster> &mon_ptr = iter->second;
         if( !mon_ptr->is_dead() ) {
             return mon_ptr;
         }
@@ -33,7 +34,7 @@ std::shared_ptr<monster> Creature_tracker::find( const tripoint &pos ) const
 int Creature_tracker::temporary_id( const monster &critter ) const
 {
     const auto iter = std::find_if( monsters_list.begin(), monsters_list.end(),
-    [&]( const std::shared_ptr<monster> &ptr ) {
+    [&]( const shared_ptr_fast<monster> &ptr ) {
         return ptr.get() == &critter;
     } );
     if( iter == monsters_list.end() ) {
@@ -42,7 +43,7 @@ int Creature_tracker::temporary_id( const monster &critter ) const
     return iter - monsters_list.begin();
 }
 
-std::shared_ptr<monster> Creature_tracker::from_temporary_id( const int id )
+shared_ptr_fast<monster> Creature_tracker::from_temporary_id( const int id )
 {
     if( static_cast<size_t>( id ) < monsters_list.size() ) {
         return monsters_list[id];
@@ -51,9 +52,9 @@ std::shared_ptr<monster> Creature_tracker::from_temporary_id( const int id )
     }
 }
 
-bool Creature_tracker::add( std::shared_ptr<monster> critter_ptr )
+bool Creature_tracker::add( const shared_ptr_fast<monster> &critter_ptr )
 {
-    assert( critter_ptr );
+    cata_assert( critter_ptr );
     monster &critter = *critter_ptr;
 
     if( critter.type->id.is_null() ) { // Don't want to spawn null monsters o.O
@@ -65,7 +66,7 @@ bool Creature_tracker::add( std::shared_ptr<monster> critter_ptr )
         return false;
     }
 
-    if( const std::shared_ptr<monster> existing_mon_ptr = find( critter.pos() ) ) {
+    if( const shared_ptr_fast<monster> existing_mon_ptr = find( critter.pos() ) ) {
         // We can spawn stuff on hallucinations, but we need to kill them first
         if( existing_mon_ptr->is_hallucination() ) {
             existing_mon_ptr->die( nullptr );
@@ -89,17 +90,17 @@ bool Creature_tracker::add( std::shared_ptr<monster> critter_ptr )
     return true;
 }
 
-void Creature_tracker::add_to_faction_map( std::shared_ptr<monster> critter_ptr )
+void Creature_tracker::add_to_faction_map( const shared_ptr_fast<monster> &critter_ptr )
 {
-    assert( critter_ptr );
+    cata_assert( critter_ptr );
     monster &critter = *critter_ptr;
 
     // Only 1 faction per mon at the moment.
     if( critter.friendly == 0 ) {
-        monster_faction_map_[ critter.faction ].insert( critter_ptr );
+        monster_faction_map_[ critter.faction ][critter_ptr->pos().z].insert( critter_ptr );
     } else {
         static const mfaction_str_id playerfaction( "player" );
-        monster_faction_map_[ playerfaction ].insert( critter_ptr );
+        monster_faction_map_[ playerfaction ][critter_ptr->pos().z].insert( critter_ptr );
     }
 }
 
@@ -117,7 +118,7 @@ bool Creature_tracker::update_pos( const monster &critter, const tripoint &new_p
         return true;
     }
 
-    if( const std::shared_ptr<monster> new_critter_ptr = find( new_pos ) ) {
+    if( const shared_ptr_fast<monster> new_critter_ptr = find( new_pos ) ) {
         auto &othermon = *new_critter_ptr;
         if( othermon.is_hallucination() ) {
             othermon.die( nullptr );
@@ -130,7 +131,7 @@ bool Creature_tracker::update_pos( const monster &critter, const tripoint &new_p
     }
 
     const auto iter = std::find_if( monsters_list.begin(), monsters_list.end(),
-    [&]( const std::shared_ptr<monster> &ptr ) {
+    [&]( const shared_ptr_fast<monster> &ptr ) {
         return ptr.get() == &critter;
     } );
     if( iter != monsters_list.end() ) {
@@ -172,7 +173,7 @@ void Creature_tracker::remove_from_location_map( const monster &critter )
 void Creature_tracker::remove( const monster &critter )
 {
     const auto iter = std::find_if( monsters_list.begin(), monsters_list.end(),
-    [&]( const std::shared_ptr<monster> &ptr ) {
+    [&]( const shared_ptr_fast<monster> &ptr ) {
         return ptr.get() == &critter;
     } );
     if( iter == monsters_list.end() ) {
@@ -181,11 +182,12 @@ void Creature_tracker::remove( const monster &critter )
     }
 
     for( auto &pair : monster_faction_map_ ) {
-        const auto fac_iter = pair.second.find( *iter );
-        if( fac_iter != pair.second.end() ) {
+        const int zpos = critter.pos().z;
+        const auto fac_iter = pair.second[zpos].find( *iter );
+        if( fac_iter != pair.second[zpos].end() ) {
             // Need to do this manually because the shared pointer containing critter is kept valid
             // within removed_ and so the weak pointer in monster_faction_map_ is also valid.
-            pair.second.erase( fac_iter );
+            pair.second[zpos].erase( fac_iter );
             break;
         }
     }
@@ -206,7 +208,7 @@ void Creature_tracker::rebuild_cache()
 {
     monsters_by_location.clear();
     monster_faction_map_.clear();
-    for( const std::shared_ptr<monster> &mon_ptr : monsters_list ) {
+    for( const shared_ptr_fast<monster> &mon_ptr : monsters_list ) {
         monsters_by_location[mon_ptr->pos()] = mon_ptr;
         add_to_faction_map( mon_ptr );
     }
@@ -223,13 +225,13 @@ void Creature_tracker::swap_positions( monster &first, monster &second )
     const auto second_iter = monsters_by_location.find( second.pos() );
     // implied: first_iter != second_iter
 
-    std::shared_ptr<monster> first_ptr;
+    shared_ptr_fast<monster> first_ptr;
     if( first_iter != monsters_by_location.end() ) {
         first_ptr = first_iter->second;
         monsters_by_location.erase( first_iter );
     }
 
-    std::shared_ptr<monster> second_ptr;
+    shared_ptr_fast<monster> second_ptr;
     if( second_iter != monsters_by_location.end() ) {
         second_ptr = second_iter->second;
         monsters_by_location.erase( second_iter );
@@ -257,8 +259,8 @@ bool Creature_tracker::kill_marked_for_death()
     // Copy the list so we can iterate the copy safely *and* add new monsters from within monster::die
     // This happens for example with blob monsters (they split into two smaller monsters).
     const auto copy = monsters_list;
-    for( const std::shared_ptr<monster> &mon_ptr : copy ) {
-        assert( mon_ptr );
+    for( const shared_ptr_fast<monster> &mon_ptr : copy ) {
+        cata_assert( mon_ptr );
         monster &critter = *mon_ptr;
         if( !critter.is_dead() ) {
             continue;
